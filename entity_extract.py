@@ -4,6 +4,7 @@ from urllib.parse import quote_plus
 from re import compile
 from re import IGNORECASE
 from requests import get
+import time
 
 # The URL for a GET request to the Wikidata API. The string parameter is the
 # SPARQL query.
@@ -37,8 +38,7 @@ MID_TO_TICKER_QUERY = (
     ' ORDER BY ?companyLabel ?rootLabel ?tickerLabel ?exchangeNameLabel')
 
 # Run entity detection.
-def detect_entities(txt):
-    language_client = language.LanguageServiceClient()
+def detect_entities(txt, language_client):
     document = language.types.Document(
         content=txt,
         type=language.enums.Document.Type.PLAIN_TEXT,
@@ -52,45 +52,69 @@ def collect_entities(entities):
     # entities which have a known stock ticker symbol.
     companies = []
     for entity in entities:
-
         # Use the Freebase ID of the entity to find company data. Skip any
         # entity which doesn't have a Freebase ID (unless we find one via
         # the Twitter handle).
         name = entity.name
         metadata = entity.metadata
-        try:
+        if (len(entity.mentions)>1) and (metadata["mid"]!='') and (entity.type>1) and (entity.salience>0.01):
             mid = metadata["mid"]
-        except KeyError:
-            #self.logs.debug("No MID found for entity: %s" % name)
-            continue
+            #print(name)
+            company_data = get_company_data(mid)
+            print(company_data)
+            # Skip any entity for which we can't find any company data.
+            if not company_data:
+                #self.logs.debug("No company data found for entity: %s (%s)" %
+                #                (name, mid))
+                continue
+            #self.logs.debug("Found company data: %s" % company_data)
 
-        company_data = get_company_data(mid)
+            for company in company_data:
 
-        # Skip any entity for which we can't find any company data.
-        if not company_data:
-            #self.logs.debug("No company data found for entity: %s (%s)" %
-            #                (name, mid))
-            continue
-        #self.logs.debug("Found company data: %s" % company_data)
+                # Extract and add a sentiment score.
+                '''sentiment = self.get_sentiment(text)'''
+                #self.logs.debug("Using sentiment for company: %s %s" %
+                #                (sentiment, company))
+                '''company["sentiment"] = sentiment'''
 
-        for company in company_data:
+                # Add the company to the list unless we already have the same
+                # ticker.
+                tickers = [existing["ticker"] for existing in companies]
+                if not company["ticker"] in tickers:
+                    companies.append(company)
+                #else:
+                #    self.logs.warn(
+                #        "Skipping company with duplicate ticker: %s" % company)
+        #except KeyError:
+        #self.logs.debug("No MID found for entity: %s" % name)
+        #    continue
 
-            # Extract and add a sentiment score.
-            '''sentiment = self.get_sentiment(text)'''
-            #self.logs.debug("Using sentiment for company: %s %s" %
-            #                (sentiment, company))
-            '''company["sentiment"] = sentiment'''
-
-            # Add the company to the list unless we already have the same
-            # ticker.
-            tickers = [existing["ticker"] for existing in companies]
-            if not company["ticker"] in tickers:
-                companies.append(company)
-            #else:
-            #    self.logs.warn(
-            #        "Skipping company with duplicate ticker: %s" % company)
     return companies
 
+def collect_ent_df(entities):
+    # Collect all entities which are publicly traded companies, i.e.
+    # entities which have a known stock ticker symbol.
+    companies = []
+    for idx in range(len(entities)):
+        # Use the Freebase ID of the entity to find company data. Skip any
+        # entity which doesn't have a Freebase ID (unless we find one via
+        # the Twitter handle).
+        if (entities.loc[idx].mentions>1) and (entities.loc[idx].mid!='') and (entities.loc[idx].Type>1) and (entities.loc[idx].salience>0.01):
+            mid = entities.loc[idx].mid
+            company_data = get_company_data(mid)
+            #print(company_data)
+            if company_data:
+                entities.loc[idx,'Ticker']=company_data[0]['ticker']
+                entities.loc[idx,'Exchange']=company_data[0]['exchange']
+                
+                for company in company_data:
+                    tickers = [existing["ticker"] for existing in companies]
+                    if not company["ticker"] in tickers:
+                        companies.append(company)
+                sys.stdout.write('\r'+str(idx) + '/'+str(len(entities))+' Ticker: ' + entities.loc[idx,'Ticker'] +" Progress {:2.2%}".format(idx / len(entities)))
+                sys.stdout.flush()
+                            
+    return companies,entities
     
 def make_wikidata_request(query):
     """Makes a request to the Wikidata SPARQL API."""
@@ -244,3 +268,51 @@ def extract_ft_articles(path, save_file_name):
 
     df.to_csv(save_file_name+'.csv')
 
+def extract_entities(df, strt, stp, delay, save_file_name):
+    ent_df=pd.DataFrame([], columns=['File','Name','Type', 'salience', 'url' ,'mentions', 'mid', 'Ticker', 'Exchange'])
+    ent_df=pd.read_csv(save_file_name+'.csv',index_col=0)
+    time_idx=0
+    time_idx1=0
+    
+    language_client = language.LanguageServiceClient()
+    
+    
+    for idx in range(strt,stp):
+        
+        text=df.loc[idx,'Content']
+        text=str(df.loc[idx,'Title'])+' '+str(text)
+
+        entities = detect_entities(text,language_client)
+        ent_lst=[{'File': df.loc[idx,'File'],'Name':entity.name,'Type':entity.type, 
+              'salience': entity.salience, 'url' :entity.metadata['wikipedia_url'],
+              'mentions':len(entity.mentions), 'mid':entity.metadata['mid']} for entity in entities]
+
+        #ent_df=[]
+        for entity in ent_lst:
+            if entity['mentions']>0 and entity['mid']!='':
+                #ent_df=ent_df + [entity]
+                ent_df=ent_df.append(entity, ignore_index=True)
+        #companies = collect_entities(entities)
+        
+        sys.stdout.write('\r'+str(idx) + ': ' + df.loc[idx,'File']+" Progress {:2.2%}".format(idx / len(df)))
+        sys.stdout.flush()
+        if time_idx == 1:
+            sys.stdout.write('\r'+str(idx) + ': ' + df.loc[idx,'File']+" PAUSE Progress {:2.2%}".format(idx / len(df)))
+            sys.stdout.flush()
+            time.sleep(delay)
+            time_idx=0
+        else:        
+            time_idx+=1
+
+        if time_idx1 == 50:
+            sys.stdout.write('\r'+str(idx) + ': ' + df.loc[idx,'File']+" PAUSE 50 Progress SAVED {:2.2%}".format(idx / len(df)))
+            sys.stdout.flush()
+            time.sleep(10*delay)
+            time_idx1=0
+            ent_df.to_csv(save_file_name+'.csv')
+        else:        
+            time_idx1+=1
+
+        
+    ent_df.to_csv(save_file_name+'.csv')
+    return ent_df
